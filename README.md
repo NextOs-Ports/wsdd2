@@ -1,16 +1,6 @@
 # wsdd2 (1.8.x)
 WSD/LLMNR Discovery/Name Service Daemon
 
-> [!NOTE]
-> **This is a NextOS mirror of Netgear's wsdd2**, kept because the upstream repository
-> vanished from GitHub in 2026. The code and all credit are Netgear's; it is
-> GPL-3.0-or-later and unmodified apart from what NextOS builds require.
->
-> Questions about **this mirror** or the NextOS builds that use it:
-> 💬 [NextOS Discord](https://discord.gg/DHfY62eDNN).
-> To support the NextOS work: [GitHub Sponsors](https://github.com/sponsors/NextOs-Ports) ·
-> [Ko-fi](https://ko-fi.com/nextos) · [PIX](https://livepix.gg/nextos).
-
 With Microsoft turning off SMB1 feature completely on Windows 10, any Samba shares on the
 local network become invisible to Windows 10 computers. That's due to the fact that SMB1 is
 required for Computer Browser service to function.
