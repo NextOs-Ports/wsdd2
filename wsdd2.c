@@ -59,6 +59,9 @@ bool is_daemon = false;
 int debug_L, debug_W, debug_N;
 const char *hostname = NULL, *hostaliases = NULL, *netbiosname = NULL, *netbiosaliases = NULL, *workgroup = NULL;
 
+static bool has_testparm = false;
+static char *smb_conf = NULL;
+
 static char *ifname = NULL;
 static unsigned ifindex = 0;
 static struct ifaddrs *ifaddrs_list = NULL;
@@ -581,14 +584,49 @@ static void sighandler(int sig)
 	}
 }
 
-static char *get_smbparm(const char *name, const char *_default)
+static void check_testparm(void)
+{
+#define __FUNCTION__	"check_testparm"
+	FILE *pp = popen("command -v testparm 2>/dev/null", "r");
+
+	if (!pp) {
+		DEBUG(0, W, __FUNCTION__ ": can't run command -v testparm");
+		return;
+	}
+
+	char buf[PAGE_SIZE];
+	if (!fgets(buf, sizeof(buf), pp) || !buf[0] || buf[0] == '\n') {
+		// Empty output when not found
+		DEBUG(1, W, "not using testparm, executable not found");
+	} else { // trim whitespace
+		DEBUG(1, W, "testparm found, using it to obtain values");
+		has_testparm = true;
+	}
+
+	pclose(pp);
+#undef __FUNCTION__
+}
+
+static char *get_smbparm(bool use_testparm, const char *name, const char *_default)
 {
 #define __FUNCTION__	"get_smbparm"
 	char *cmd = NULL, *result = NULL;
 
-	if (asprintf(&cmd, "testparm -s --parameter-name=\"%s\" 2>/dev/null", name) <= 0) {
-		DEBUG(0, W, __FUNCTION__ ": can't allocate cmd string");
-		return NULL;
+	if (!use_testparm) {
+		DEBUG(1, W, "no testparm found, using default value of \"%s\": %s", name, _default);
+		return strdup(_default);
+	}
+
+	if (smb_conf && strlen(smb_conf)) {
+		if (asprintf(&cmd, "testparm -s --parameter-name=\"%s\" \"%s\" 2>/dev/null", name, smb_conf) <= 0) {
+			DEBUG(0, W, __FUNCTION__ ": can't allocate cmd string");
+			return NULL;
+		}
+	} else {
+		if (asprintf(&cmd, "testparm -s --parameter-name=\"%s\" 2>/dev/null", name) <= 0) {
+			DEBUG(0, W, __FUNCTION__ ": can't allocate cmd string");
+			return NULL;
+		}
 	}
 
 	FILE *pp = popen(cmd, "r");
@@ -600,8 +638,11 @@ static char *get_smbparm(const char *name, const char *_default)
 	}
 
 	char buf[PAGE_SIZE];
-	if (!fgets(buf, sizeof(buf), pp) || !buf[0]  || buf[0] == '\n') {
+	if (!fgets(buf, sizeof(buf), pp) || !buf[0]) {
 		DEBUG(0, W, "cannot read %s from testparm", name);
+		result = strdup(_default);
+	} else if (buf[0] == '\n') {
+		DEBUG(1, W, "testparm have not found value of \"%s\", using default: %s", name, _default);
 		result = strdup(_default);
 	} else { // trim whitespace
 		char *p;
@@ -609,6 +650,7 @@ static char *get_smbparm(const char *name, const char *_default)
 			*p = '\0';
 		for (p = buf; *p && isspace(*p); p++)
 			;
+		DEBUG(2, W, "testparm found value of \"%s\": %s", name, p);
 		result = strdup(p);
 	}
 
@@ -617,8 +659,72 @@ static char *get_smbparm(const char *name, const char *_default)
 #undef __FUNCTION__
 }
 
+static void find_config_file()
+{
+	char *config_file = NULL;
+	if (!(config_file = get_smbparm(true, "config file", "")))
+		err(EXIT_FAILURE, "get_smbparm");
+
+	if (strlen(config_file) > 0 && access(config_file, F_OK) == 0) {
+		if (smb_conf)
+			free(smb_conf);
+		smb_conf = config_file;
+	} else
+		free(config_file);
+}
+
+static void init_sysinfo()
+{
+	check_testparm();
+
+	if (has_testparm)
+		find_config_file();
+
+	if (!hostname) {
+		char hostn[HOST_NAME_MAX + 1];
+		if (gethostname(hostn, sizeof(hostn) - 1) != 0)
+			err(EXIT_FAILURE, "gethostname");
+
+		char *p = strchr(hostn, '.');
+		if (p) *p = '\0';
+		hostname = strdup(hostn);
+		if (!hostname)
+			err(EXIT_FAILURE, "strdup");
+	}
+
+	if (!hostaliases && !(hostaliases = get_smbparm(has_testparm, "additional dns hostnames", "")))
+		err(EXIT_FAILURE, "get_smbparm");
+
+	if (!netbiosname) {
+		char *netbiosname_default = strdup(hostname);
+		if (!netbiosname_default)
+			err(EXIT_FAILURE, "strdup");
+
+		char *s = netbiosname_default;
+		while (*s) {
+			*s = toupper(*s);
+			s++;
+		}
+
+		if (!(netbiosname = get_smbparm(has_testparm, "netbios name", netbiosname_default)))
+			err(EXIT_FAILURE, "get_smbparm");
+
+		free(netbiosname_default);
+	}
+
+	if (!netbiosaliases && !(netbiosaliases = get_smbparm(has_testparm, "netbios aliases", "")))
+		err(EXIT_FAILURE, "get_smbparm");
+
+	if (!workgroup && !(workgroup = get_smbparm(has_testparm, "workgroup", "WORKGROUP")))
+		err(EXIT_FAILURE, "get_smbparm");
+
+	init_getresp();
+}
+
 static void help(const char *prog, int ec, const char *fmt, ...)
 {
+	init_sysinfo();
+
 	if (fmt) {
 		va_list ap;
 		va_start(ap, fmt);
@@ -627,55 +733,31 @@ static void help(const char *prog, int ec, const char *fmt, ...)
 		puts("\n");
 	}
 	printf( "WSDD and LLMNR daemon\n"
-		"Usage: %s [options]\n"
-		"       -h this message\n"
-		"       -d become daemon\n"
-		"       -4 IPv4 only\n"
-		"       -6 IPv6 only\n"
-		"       -u UDP only\n"
-		"       -t TCP only\n"
-		"       -l LLMNR only\n"
-		"       -w WSDD only\n"
-		"       -L increment LLMNR debug level (%d)\n"
-		"       -W increment WSDD debug level (%d)\n"
-		"       -i <interface> reply only on this interface (%s)\n"
-		"       -H <name> set host name (%s)\n"
-		"       -A \"name list\" set host aliases (%s)\n"
-		"       -N <name> set netbios name (%s)\n"
-		"       -B \"name list\" set netbios aliases (%s)\n"
-		"       -G <name> set workgroup (%s)\n"
-		"       -b \"key1:val1,key2:val2,...\" boot parameters:\n",
-		prog, debug_L, debug_W, ifname ? ifname : "any",
-		hostname, hostaliases, netbiosname, netbiosaliases, workgroup
+			"Usage: %s [options]\n"
+			"       -h this message\n"
+			"       -d become daemon\n"
+			"       -4 IPv4 only\n"
+			"       -6 IPv6 only\n"
+			"       -u UDP only\n"
+			"       -t TCP only\n"
+			"       -l LLMNR only\n"
+			"       -w WSDD only\n"
+			"       -L increment LLMNR debug level (%d)\n"
+			"       -W increment WSDD debug level (%d)\n"
+			"       -i <interface> reply only on this interface (%s)\n"
+			"       -c <file> read smb.conf from non-default location (%s)\n"
+			"       -H <name> set host name (%s)\n"
+			"       -A \"name list\" set host aliases (%s)\n"
+			"       -N <name> set netbios name (%s)\n"
+			"       -B \"name list\" set netbios aliases (%s)\n"
+			"       -G <name> set workgroup (%s)\n"
+			"       -b \"key1:val1,key2:val2,...\" boot parameters:\n",
+			prog, debug_L, debug_W, ifname ? ifname : "any",
+			has_testparm ? (smb_conf ? smb_conf : "default") : "testparm not found, ignored",
+			hostname, hostaliases, netbiosname, netbiosaliases, workgroup
 	);
 	printBootInfoKeys(stdout, 11);
 	exit(ec);
-}
-
-static void init_sysinfo()
-{
-	char hostn[HOST_NAME_MAX + 1];
-
-	if (!hostname && gethostname(hostn, sizeof(hostn) - 1) != 0)
-		err(EXIT_FAILURE, "gethostname");
-
-	char *p = strchr(hostn, '.');
-	if (p) *p = '\0';
-	hostname = strdup(hostn);
-
-	if (!hostaliases && !(hostaliases = get_smbparm("additional dns hostnames", "")))
-		err(EXIT_FAILURE, "get_smbparm");
-
-	if (!netbiosname && !(netbiosname = get_smbparm("netbios name", hostname)))
-		err(EXIT_FAILURE, "get_smbparm");
-
-	if (!netbiosaliases && !(netbiosaliases = get_smbparm("netbios aliases", "")))
-		err(EXIT_FAILURE, "get_smbparm");
-
-	if (!workgroup && !(workgroup = get_smbparm("workgroup", "WORKGROUP")))
-		err(EXIT_FAILURE, "get_smbparm");
-
-	init_getresp();
 }
 
 #define	_4	1
@@ -690,13 +772,12 @@ int main(int argc, char **argv)
 	int opt;
 	const char *prog = basename(argv[0]);
 	unsigned int ipv46 = 0, tcpudp = 0, llmnrwsdd = 0;
+	bool print_help = false;
 
-	init_sysinfo();
-
-	while ((opt = getopt(argc, argv, "hd46utlwLWi:H:N:G:b:")) != -1) {
+	while ((opt = getopt(argc, argv, "hd46utlwLWi:H:A:N:B:G:b:c:")) != -1) {
 		switch (opt) {
 		case 'h':
-			help(prog, EXIT_SUCCESS, NULL);
+			print_help = true;
 			break;
 		case 'd':
 			is_daemon = true;
@@ -740,9 +821,17 @@ int main(int argc, char **argv)
 			if (optarg != NULL && strlen(optarg) > 0)
 				hostname = strdup(optarg);
 			break;
+		case 'A':
+			if (optarg != NULL && strlen(optarg) > 0)
+				hostaliases = strdup(optarg);
+			break;
 		case 'N':
 			if (optarg != NULL && strlen(optarg) > 0)
 				netbiosname = strdup(optarg);
+			break;
+		case 'B':
+			if (optarg != NULL && strlen(optarg) > 0)
+				netbiosaliases = strdup(optarg);
 			break;
 		case 'G':
 			if (optarg != NULL && strlen(optarg) > 0)
@@ -753,8 +842,12 @@ int main(int argc, char **argv)
 				if (set_getresp(optarg, (const char **)&optarg) != 0)
 					help(prog, EXIT_FAILURE, "Bad key:val '%s'", optarg);
 			break;
+		case 'c':
+			if (optarg != NULL && strlen(optarg) > 0)
+				smb_conf = strdup(optarg);
+			break;
 		case '?':
-			if (strchr("iHNGb", optopt))
+			if (strchr("iHNAGBbc", optopt))
 				printf("Option -%c requires an argument.\n", optopt);
 			/* ... fall through ... */
 		default:
@@ -764,6 +857,11 @@ int main(int argc, char **argv)
 
 	if (argc > optind)
 		help(prog, EXIT_FAILURE, "Unknown argument '%s'", argv[optind]);
+
+	if (print_help)
+		help(prog, EXIT_SUCCESS, NULL);
+
+	init_sysinfo();
 
 	if (!ipv46)
 		ipv46 = _4 | _6;
